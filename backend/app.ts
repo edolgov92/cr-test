@@ -4,6 +4,22 @@ import { createClient } from 'redis';
 
 export const DEFAULT_BALANCE = 100;
 
+const CHARGE_SCRIPT = `
+    local key = KEYS[1]
+    local chargeAmount = ARGV[1]
+    local balance = redis.call('get', key) or 0
+    balance = tonumber(balance)
+    chargeAmount = tonumber(chargeAmount)
+
+    if balance >= chargeAmount then
+        local newBalance = balance - chargeAmount
+        redis.call('set', key, newBalance)
+        return newBalance
+    else
+        return -1
+    end
+`;
+
 interface ChargeResult {
     isAuthorized: boolean;
     remainingBalance: number;
@@ -30,14 +46,12 @@ async function reset(account: string): Promise<void> {
 async function charge(account: string, charges: number): Promise<ChargeResult> {
     const client = await connect();
     try {
-        const balance = parseInt((await client.get(`${account}/balance`)) ?? "");
-        if (balance >= charges) {
-            await client.set(`${account}/balance`, balance - charges);
-            const remainingBalance = parseInt((await client.get(`${account}/balance`)) ?? "");
-            return { isAuthorized: true, remainingBalance, charges };
-        } else {
-            return { isAuthorized: false, remainingBalance: balance, charges: 0 };
-        }
+        const remainingBalance: number = (await client.eval(CHARGE_SCRIPT, {
+            keys: [`${account}/balance`],
+            arguments: [charges.toString()],
+        })) as number;
+        const isAuthorized: boolean = remainingBalance >= 0;
+        return { isAuthorized, remainingBalance, charges: isAuthorized ? charges : 0 };
     } finally {
         await client.disconnect();
     }
@@ -50,7 +64,7 @@ export function buildApp(): express.Application {
         try {
             const account = req.body.account ?? "account";
             await reset(account);
-            console.log(`Successfully reset account ${account}`);
+            console.log(`Successfully reset account "${account}"`);
             res.sendStatus(204);
         } catch (e) {
             console.error("Error while resetting account", e);
@@ -61,7 +75,11 @@ export function buildApp(): express.Application {
         try {
             const account = req.body.account ?? "account";
             const result = await charge(account, req.body.charges ?? 10);
-            console.log(`Successfully charged account ${account}`);
+            if (result.isAuthorized) {
+                console.log(`Authorized and successfully charged account "${account}"`);
+            } else {
+                console.log(`Not authorized for account "${account}"`);
+            }
             res.status(200).json(result);
         } catch (e) {
             console.error("Error while charging account", e);
